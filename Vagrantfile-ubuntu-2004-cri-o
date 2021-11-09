@@ -1,0 +1,216 @@
+Vagrant.configure("2") do |config|
+    config.vm.provision :shell, privileged: true, inline: $install_common_tools
+    # adding the below line because of Hash sum mismatch error during vbguest utils update
+    config.vbguest.auto_update = false
+    # set VAGRANT_PREFER_SYSTEM_BIN=0 in the cmd prompt when facing issues with vagrant ssh
+    # minimum of 2 cpus required for kubeadm to create the cluster
+    config.vm.define :cmaster do |cmaster|
+      cmaster.vm.provider :virtualbox do |vb|
+        vb.name = "cmaster"
+        vb.memory = 4096
+        vb.cpus = 2
+      end
+      cmaster.vm.box = "ubuntu/focal64"
+      cmaster.disksize.size = "50GB"      
+      cmaster.vm.hostname = "cmaster"
+      cmaster.vm.network :private_network, ip: "10.0.0.10"
+      cmaster.vm.provision :shell, privileged: false, inline: $provision_cmaster_node
+    end
+  
+    %w{cnode1 cnode2 cnode3}.each_with_index do |name, i|
+      config.vm.define name do |cnode|
+        cnode.vm.provider "virtualbox" do |vb|
+          vb.name = "cnode#{i + 1}"
+          vb.memory = 2048
+          vb.cpus = 2
+        end
+        cnode.vm.box = "ubuntu/focal64"
+        cnode.disksize.size = "50GB"
+        cnode.vm.hostname = name
+        cnode.vm.network :private_network, ip: "10.0.0.#{i + 11}"
+        cnode.vm.provision :shell, privileged: false, inline: <<-SHELL
+  sudo /vagrant/join.sh
+  echo 'Environment="KUBELET_EXTRA_ARGS=--node-ip=10.0.0.#{i + 11}"' | sudo tee -a /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+  cat /vagrant/id_rsa.pub >> /home/vagrant/.ssh/authorized_keys
+  sudo systemctl daemon-reload
+  sudo systemctl restart kubelet
+  SHELL
+      end
+    end  
+    config.vm.provision "shell", inline: $install_multicast
+  end
+  
+  
+$install_common_tools = <<-SCRIPT
+
+  sudo rm -rf /var/lib/apt/lists/*
+  sudo su -
+  mkdir /etc/gcrypt
+  echo "all" >> /etc/gcrypt/hwf.deny
+
+
+#VERSION=1.22:1.22.0
+VERSION=1.22
+OS=xUbuntu_20.04
+  
+  apt-get install dos2unix
+  # bridged traffic to iptables is enabled for kube-router.
+cat >> /etc/ufw/sysctl.conf <<EOF
+net/bridge/bridge-nf-call-ip6tables = 1
+net/bridge/bridge-nf-call-iptables = 1
+net/bridge/bridge-nf-call-arptables = 1
+EOF
+  
+  set -e
+  IFNAME=$1
+  ADDRESS="$(ip -4 addr show $IFNAME | grep "inet" | head -1 |awk '{print $2}' | cut -d/ -f1)"
+  sed -e "s/^.*${HOSTNAME}.*/${ADDRESS} ${HOSTNAME} ${HOSTNAME}.local/" -i /etc/hosts
+  
+  # remove ubuntu-focal entry
+  sed -e '/^.*ubuntu-focal.*/d' -i /etc/hosts
+
+  
+
+  sudo apt-get clean
+  # Patch OS
+  apt-get update && apt-get upgrade -y
+  
+  # Create local host entries
+  echo "10.0.0.10 cmaster" >> /etc/hosts
+  echo "10.0.0.11 cnode1" >> /etc/hosts
+  echo "10.0.0.12 cnode2" >> /etc/hosts
+  echo "10.0.0.13 cnode3" >> /etc/hosts
+  
+  # disable swap
+  swapoff -a
+  sed -i '/swap/d' /etc/fstab
+
+  # Create the .conf file to load the modules at bootup
+cat <<EOF | sudo tee /etc/modules-load.d/crio.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+# Set up required sysctl params, these persist across reboots.
+cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+
+sudo sysctl --system
+
+cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /
+EOF
+cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
+deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /
+EOF
+
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
+curl -L https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:$VERSION/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers-cri-o.gpg add -
+
+sudo apt-get clean
+sudo apt-get update
+sudo apt-get install -y cri-o cri-o-runc
+
+sudo systemctl daemon-reload
+sudo systemctl enable crio --now
+  
+  # Install kubeadm, kubectl and kubelet
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -qq install ebtables ethtool
+  sudo apt-get clean
+  apt-get -qq update
+  # apt-get -qq install -y docker.io apt-transport-https curl
+  apt-get -qq install -y apt-transport-https curl
+  #apt-get update -qq && apt-get install -y \
+  #libbtrfs-dev \
+  #containers-common \
+  #git \
+  #golang-go \
+  #libassuan-dev \
+  #libdevmapper-dev \
+  #libglib2.0-dev \
+  #libc6-dev \
+  #libgpgme-dev \
+  #libgpg-error-dev \
+  #libseccomp-dev \
+  #libsystemd-dev \
+  #libselinux1-dev \
+  #pkg-config \
+  #go-md2man \
+  #cri-o-runc \
+  #libudev-dev \
+  #software-properties-common \
+  #gcc \
+  #make
+  systemctl restart crio
+  curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+  
+
+sudo systemctl daemon-reload
+#sudo systemctl restart docker
+
+
+cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
+deb http://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+sudo apt-get clean
+  apt-get -qq update
+  apt-get -qq install -y kubelet kubeadm kubectl
+  apt-mark hold kubelet kubectl kubeadm
+  
+  # Set external DNS
+  sed -i -e 's/#DNS=/DNS=8.8.8.8/' /etc/systemd/resolved.conf
+  service systemd-resolved restart
+SCRIPT
+  
+$provision_cmaster_node = <<-SHELL
+  OUTPUT_FILE=/vagrant/join.sh
+  KEY_FILE=/vagrant/id_rsa.pub
+  rm -rf $OUTPUT_FILE
+  rm -rf $KEY_FILE
+  
+  # Create key
+  ssh-keygen -q -t rsa -b 4096 -N '' -f /home/vagrant/.ssh/id_rsa
+  cat /home/vagrant/.ssh/id_rsa.pub >> /home/vagrant/.ssh/authorized_keys
+  cat /home/vagrant/.ssh/id_rsa.pub > ${KEY_FILE}
+  
+  # Start cluster
+  # sudo kubeadm init --apiserver-advertise-address=10.0.0.10 --pod-network-cidr=10.244.0.0/16 | grep -Ei "kubeadm join|discovery-token-ca-cert-hash" > ${OUTPUT_FILE}
+  sudo kubeadm init --cri-socket=/var/run/crio/crio.sock --kubernetes-version $(kubeadm version -o short) --apiserver-advertise-address=10.0.0.10 --pod-network-cidr=10.244.0.0/16 | grep -Ei "kubeadm join|discovery-token-ca-cert-hash" > ${OUTPUT_FILE}
+  chmod +x $OUTPUT_FILE
+  
+  # Configure kubectl for vagrant and root users
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+  sudo mkdir -p /root/.kube
+  sudo cp -i /etc/kubernetes/admin.conf /root/.kube/config
+  sudo chown -R root:root /root/.kube
+  
+  # Fix kubelet IP
+  sudo echo 'Environment="KUBELET_EXTRA_ARGS=--node-ip=10.0.0.10"' | sudo tee -a /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+  
+  # Use our flannel config file so that routing will work properly
+  kubectl create -f /vagrant/kube-flannel.yml
+  
+  # Set alias on cmaster for vagrant and root users
+  echo "alias k=/usr/bin/kubectl" >> $HOME/.bash_profile
+  sudo echo "alias k=/usr/bin/kubectl" >> /root/.bash_profile
+  
+  # Install the etcd client
+  sudo apt install etcd-client
+
+  
+  sudo systemctl daemon-reload
+  sudo systemctl restart kubelet
+SHELL
+  
+$install_multicast = <<-SHELL
+  apt-get -qq install -y avahi-daemon libnss-mdns
+SHELL
